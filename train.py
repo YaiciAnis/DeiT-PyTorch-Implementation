@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 from torch.utils.data import TensorDataset, DataLoader
 
+# pyrefly: ignore[missing-import]
 from torchvision.models import (
     regnet_y_16gf,
     RegNet_Y_16GF_Weights
