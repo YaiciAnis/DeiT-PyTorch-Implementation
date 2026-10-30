@@ -101,20 +101,40 @@ class DistillationLoss(nn.Module):
         self,
         distillation_type="hard",
         alpha=0.5,
-        tau=1.0
+        tau=1.0,
+        label_smoothing=0.1
     ):
         super().__init__()
 
         assert distillation_type in ["hard", "soft"]
         assert 0.0 <= alpha <= 1.0
         assert tau > 0.0
+        assert 0.0 <= label_smoothing < 1.0
 
         self.distillation_type = distillation_type
         self.alpha = alpha
         self.tau = tau
+        self.label_smoothing = label_smoothing
 
-        # Fonction de perte Cross-Entropy.
-        self.cross_entropy = nn.CrossEntropyLoss()
+        # ----------------------------------------------------
+        # LABEL SMOOTHING (section 4 du papier, epsilon = 0.1)
+        # ----------------------------------------------------
+        # Un label dur "100 % classe 5" devient une cible adoucie :
+        # (1 - epsilon) pour la bonne classe et epsilon réparti
+        # sur les classes (la formule de PyTorch et de timm).
+        #
+        # Le papier précise : on lisse les VRAIS labels, mais
+        # PAS les pseudo-labels du Teacher (hard distillation).
+        # Il faut donc deux fonctions de perte distinctes.
+        # ----------------------------------------------------
+
+        # Perte sur les vrais labels : avec label smoothing.
+        self.ce_labels = nn.CrossEntropyLoss(
+            label_smoothing=label_smoothing
+        )
+
+        # Perte sur les labels du Teacher : sans label smoothing.
+        self.ce_teacher = nn.CrossEntropyLoss()
 
     def forward(
         self,
@@ -131,7 +151,7 @@ class DistillationLoss(nn.Module):
         # avec les vraies étiquettes.
         # ----------------------------------------------------
 
-        loss_cls = self.cross_entropy(
+        loss_cls = self.ce_labels(
             cls_logits,
             labels
         )
@@ -149,7 +169,7 @@ class DistillationLoss(nn.Module):
             teacher_labels = teacher_logits.argmax(dim=1)
 
             # Comparer DIST aux classes du Teacher.
-            loss_dist = self.cross_entropy(
+            loss_dist = self.ce_teacher(
                 dist_logits,
                 teacher_labels
             )
@@ -456,6 +476,22 @@ if __name__ == "__main__":
     assert torch.allclose(
         loss_total,
         0.5 * loss_cls + 0.5 * loss_dist
+    )
+
+    # Vérifier le label smoothing : appliqué aux vrais labels
+    # (tête CLS) mais pas aux labels du Teacher (tête DIST).
+    assert torch.allclose(
+        loss_cls,
+        F.cross_entropy(
+            cls_logits, labels, label_smoothing=0.1
+        )
+    )
+
+    assert torch.allclose(
+        loss_dist,
+        F.cross_entropy(
+            dist_logits, teacher_logits.argmax(dim=1)
+        )
     )
 
     # --------------------------------------------------------

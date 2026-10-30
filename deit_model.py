@@ -13,20 +13,35 @@ import torch.nn as nn
 # Sortie : (B, 196, 192)
 # ============================================================
 
+# Les valeurs par défaut correspondent à ImageNet (224, patch 16).
+# Pour CIFAR-10 : img_size=32 et patch_size=4 (soit 8 x 8 = 64
+# patches, chacun de 3 x 4 x 4 = 48 valeurs).
+
 class PatchEmbedding(nn.Module):
 
-    def __init__(self):
+    def __init__(
+        self,
+        img_size=224,
+        patch_size=16,
+        in_chans=3,
+        embed_dim=192
+    ):
         super().__init__()
 
+        assert img_size % patch_size == 0
+
+        self.num_patches = (img_size // patch_size) ** 2
+
         self.proj = nn.Conv2d(
-            in_channels=3,
-            out_channels=192,
-            kernel_size=16,
-            stride=16
+            in_channels=in_chans,
+            out_channels=embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size
         )
 
     def forward(self, images):
 
+        # Exemple ImageNet :
         # (B, 3, 224, 224) -> (B, 192, 14, 14)
         x = self.proj(images)
 
@@ -48,19 +63,21 @@ class PatchEmbedding(nn.Module):
 
 class TokenEmbedding(nn.Module):
 
-    def __init__(self):
+    def __init__(self, num_patches=196, embed_dim=192):
         super().__init__()
 
         self.cls_token = nn.Parameter(
-            torch.zeros(1, 1, 192)
+            torch.zeros(1, 1, embed_dim)
         )
 
         self.dist_token = nn.Parameter(
-            torch.zeros(1, 1, 192)
+            torch.zeros(1, 1, embed_dim)
         )
 
+        # Un embedding de position par token :
+        # num_patches + CLS + DIST.
         self.pos_embed = nn.Parameter(
-            torch.zeros(1, 198, 192)
+            torch.zeros(1, num_patches + 2, embed_dim)
         )
 
         nn.init.trunc_normal_(self.cls_token, std=0.02)
@@ -306,31 +323,79 @@ class TransformerEncoder(nn.Module):
 
 class DeiTTinyDistilled(nn.Module):
 
+    # Par défaut : DeiT-Tiny pour ImageNet (224, patch 16, 1000 classes).
+    # Pour CIFAR-10 :
+    #   DeiTTinyDistilled(img_size=32, patch_size=4, num_classes=10)
+
     def __init__(
         self,
+        img_size=224,
+        patch_size=16,
         num_classes=1000,
+        embed_dim=192,
+        depth=12,
+        num_heads=3,
         drop_path_rate=0.1
     ):
         super().__init__()
 
-        self.patch_embed = PatchEmbedding()
-        self.token_embed = TokenEmbedding()
+        self.patch_embed = PatchEmbedding(
+            img_size=img_size,
+            patch_size=patch_size,
+            embed_dim=embed_dim
+        )
+
+        self.token_embed = TokenEmbedding(
+            num_patches=self.patch_embed.num_patches,
+            embed_dim=embed_dim
+        )
 
         self.encoder = TransformerEncoder(
-            embed_dim=192,
-            num_heads=3,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
             mlp_ratio=4,
-            depth=12,
+            depth=depth,
             drop_path_rate=drop_path_rate
         )
 
-        self.norm = nn.LayerNorm(192)
+        self.norm = nn.LayerNorm(embed_dim)
 
         # Tête de classification CLS.
-        self.head = nn.Linear(192, num_classes)
+        self.head = nn.Linear(embed_dim, num_classes)
 
         # Tête de distillation DIST.
-        self.head_dist = nn.Linear(192, num_classes)
+        self.head_dist = nn.Linear(embed_dim, num_classes)
+
+        # Initialisation de toutes les couches (voir ci-dessous).
+        self.apply(self._init_weights)
+
+    # --------------------------------------------------------
+    # INITIALISATION (section 6 du papier)
+    # --------------------------------------------------------
+    # Le papier explique que les Transformers sont sensibles
+    # à l'initialisation et que certaines options ne convergent
+    # pas. Ils initialisent les poids avec une loi NORMALE
+    # TRONQUÉE (Hanin & Rolnick, 2018).
+    #
+    # L'écart-type 0.02 n'est pas donné dans le papier : c'est
+    # la convention de la bibliothèque timm, sur laquelle DeiT
+    # s'appuie.
+    # --------------------------------------------------------
+
+    @staticmethod
+    def _init_weights(module):
+
+        if isinstance(module, nn.Linear):
+
+            nn.init.trunc_normal_(module.weight, std=0.02)
+
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+        elif isinstance(module, nn.LayerNorm):
+
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
 
     def forward(self, images):
 
@@ -357,6 +422,29 @@ class DeiTTinyDistilled(nn.Module):
         dist_logits = self.head_dist(dist_token)
 
         return cls_logits, dist_logits
+
+    # --------------------------------------------------------
+    # PRÉDICTION FINALE : FUSION TARDIVE (section 4 du papier)
+    # --------------------------------------------------------
+    # À l'inférence, les deux têtes savent prédire la classe.
+    # La méthode de référence du papier est la "fusion tardive" :
+    # on additionne les SORTIES SOFTMAX des deux classifieurs.
+    # Cette méthode ne s'entraîne pas, elle sert à l'évaluation.
+    # Appeler model.eval() avant, pour désactiver DropPath.
+    # --------------------------------------------------------
+
+    @torch.no_grad()
+    def predict(self, images):
+
+        cls_logits, dist_logits = self(images)
+
+        # Chaque softmax donne une distribution (somme = 1).
+        cls_probs = cls_logits.softmax(dim=-1)
+        dist_probs = dist_logits.softmax(dim=-1)
+
+        # (B, num_classes), somme = 2. La classe prédite
+        # est l'argmax de ce résultat.
+        return cls_probs + dist_probs
 
 
 # ============================================================
@@ -443,5 +531,57 @@ if __name__ == "__main__":
     assert train_output.shape == test_tensor.shape
     assert torch.equal(eval_output, test_tensor)
     assert 0 < dropped < 100
+
+    # Vérifier la fusion tardive (somme de deux softmax = 2).
+    with torch.no_grad():
+        probs = model.predict(images)
+
+    predicted_classes = probs.argmax(dim=-1)
+
+    print("Fusion tardive :", probs.shape)
+    print("Classes prédites :", predicted_classes.tolist())
+
+    assert probs.shape == (2, 1000)
+    assert torch.allclose(
+        probs.sum(dim=-1),
+        torch.full((2,), 2.0),
+        atol=1e-4
+    )
+    assert predicted_classes.shape == (2,)
+
+    # Vérifier l'initialisation normale tronquée (std = 0.02).
+    qkv_weight = model.encoder.blocks[0].attn.qkv.weight
+
+    print("Écart-type des poids qkv :", qkv_weight.std().item())
+
+    assert abs(qkv_weight.std().item() - 0.02) < 0.002
+    assert torch.count_nonzero(model.head.bias) == 0
+    assert torch.count_nonzero(model.head_dist.bias) == 0
+    assert torch.all(model.norm.weight == 1.0)
+
+    # Vérifier la configuration CIFAR-10 :
+    # images 32 x 32, patchs 4 x 4, 10 classes.
+    cifar_model = DeiTTinyDistilled(
+        img_size=32,
+        patch_size=4,
+        num_classes=10
+    )
+
+    cifar_model.eval()
+
+    cifar_images = torch.randn(2, 3, 32, 32)
+
+    with torch.no_grad():
+        c_cls, c_dist = cifar_model(cifar_images)
+        c_probs = cifar_model.predict(cifar_images)
+
+    print("CIFAR-10 : patches :", cifar_model.patch_embed.num_patches)
+    print("CIFAR-10 : tokens  :", cifar_model.token_embed.pos_embed.shape[1])
+
+    assert cifar_model.patch_embed.num_patches == 64
+    assert cifar_model.token_embed.pos_embed.shape == (1, 66, 192)
+    assert c_cls.shape == (2, 10)
+    assert c_dist.shape == (2, 10)
+    assert c_probs.shape == (2, 10)
 
     print("Tests des étapes 1 à 8 réussis !")

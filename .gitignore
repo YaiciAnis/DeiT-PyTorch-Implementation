@@ -4,3 +4,5 @@
 venv/
 __pycache__/
 *.pyc
+lancer_tests.ps1
+resultats_tests.txt
